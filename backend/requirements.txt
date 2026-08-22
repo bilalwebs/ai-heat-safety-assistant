@@ -1,0 +1,15 @@
+# --- Runtime ---------------------------------------------------------
+fastapi>=0.115,<1.0
+uvicorn>=0.30,<1.0
+pydantic>=2.7,<3.0
+pydantic-settings>=2.3,<3.0
+httpx>=0.27,<1.0
+python-dotenv>=1.0,<2.0
+
+# --- Testing ---------------------------------------------------------
+pytest>=8.2,<9.0
+pytest-asyncio>=0.23,<1.0
+
+# Note: for higher throughput you may install `uvicorn[standard]` instead of
+# `uvicorn`, but plain uvicorn avoids optional native build dependencies and
+# runs everywhere (including fresh Python builds on Windows).
