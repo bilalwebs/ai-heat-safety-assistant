@@ -31,14 +31,18 @@ value is found it raises rather than inventing one.
 
 from __future__ import annotations
 
+import asyncio
+import time
 from typing import Any
 
 import httpx
 
 from app.core.config import Settings
 from app.core.exceptions import (
+    FortyGuardActivityNotFoundError,
     FortyGuardNotConfiguredError,
     FortyGuardResponseError,
+    FortyGuardTaskFailedError,
     FortyGuardTimeoutError,
     FortyGuardUnavailableError,
     FortyGuardUpstreamError,
@@ -65,6 +69,23 @@ _HUMIDITY_KEYS = ("humidity", "humidity_percent", "relative_humidity", "rh")
 _RISK_KEYS = ("risk_level", "risk", "heat_risk", "category", "severity")
 _RESOLUTION_KEYS = ("resolution", "precision", "spatial_resolution")
 _TIME_KEYS = ("measured_at", "timestamp", "time", "observed_at", "datetime")
+
+# ---------------------------------------------------------------------------
+# Async heatmap workflow (verified against the official quickstart client).
+#   submit:  POST /v1/heatmap                 -> data.activity_id
+#   poll:    GET  /v1/status/{activity_id}    -> data.status (+ data.result)
+# Auth is the custom `api-key` header (NOT Authorization: Bearer).
+# ---------------------------------------------------------------------------
+_HEATMAP_PATH = "/v1/heatmap"
+_STATUS_PATH = "/v1/status/{activity_id}"
+
+# status values are lower-cased before comparison
+_TERMINAL_SUCCESS = frozenset({"succeeded", "completed", "success", "done"})
+_TERMINAL_FAILURE = frozenset({"failed", "error", "failure"})
+
+
+class _ActivityNotReady(Exception):
+    """Internal signal: the status endpoint 404'd (result not visible yet)."""
 
 
 class FortyGuardService:
@@ -138,7 +159,247 @@ class FortyGuardService:
 
         return self._normalize(data, query)
 
+    # ----- heatmap (async submit -> poll workflow) ---------------------
+    def _heatmap_headers(self) -> dict[str, str]:
+        """Verified FortyGuard auth for the async endpoints.
+
+        The header is the custom ``api-key`` (NOT ``Authorization: Bearer``).
+        Built explicitly here so the heatmap flow is robust to any stale
+        ``FORTYGUARD_AUTH_*`` values left over from the legacy config.
+        """
+        return {
+            "api-key": self._settings.fortyguard_api_key or "",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+
+    async def submit_heatmap(self, payload: dict[str, Any]) -> str:
+        """Submit a heatmap job and return its ``activity_id``.
+
+        ``payload`` must already be the verified FortyGuard body (see
+        :meth:`app.schemas.heatmap.HeatmapRequest.to_payload`). Never logs the
+        payload or the key — only that a submit started and the resulting id.
+        """
+        if not self._settings.fortyguard_ready:
+            raise FortyGuardNotConfiguredError()
+
+        client = self._get_client()
+        logger.info(
+            "FortyGuard heatmap submit: POST %s (auth via api-key: %s)",
+            _HEATMAP_PATH,
+            redact(self._settings.fortyguard_api_key),
+        )
+        try:
+            response = await client.post(
+                _HEATMAP_PATH, headers=self._heatmap_headers(), json=payload
+            )
+        except httpx.TimeoutException as exc:
+            logger.warning("FortyGuard submit timed out: %s", exc)
+            raise FortyGuardTimeoutError() from exc
+        except httpx.TransportError as exc:
+            logger.warning("FortyGuard submit connection error: %s", exc)
+            raise FortyGuardUnavailableError() from exc
+
+        self._raise_for_status(response)
+        data = self._parse_json(response)
+        if isinstance(data, dict) and data.get("error"):
+            raise FortyGuardUpstreamError(self._error_message(data))
+
+        activity_id = self._extract_activity_id(data)
+        logger.info("FortyGuard heatmap submitted: activity_id=%s", activity_id)
+        return activity_id
+
+    async def get_activity(self, activity_id: str) -> dict[str, Any]:
+        """Fetch the current status/result object for ``activity_id``.
+
+        Returns the upstream ``data`` object (contains ``status`` and, once
+        finished, ``result``). Raises :class:`_ActivityNotReady` on a 404 so
+        callers can distinguish "not visible yet" from a real error.
+        """
+        if not self._settings.fortyguard_ready:
+            raise FortyGuardNotConfiguredError()
+
+        client = self._get_client()
+        path = _STATUS_PATH.format(activity_id=activity_id)
+        try:
+            response = await client.get(path, headers=self._heatmap_headers())
+        except httpx.TimeoutException as exc:
+            logger.warning("FortyGuard status timed out: %s", exc)
+            raise FortyGuardTimeoutError() from exc
+        except httpx.TransportError as exc:
+            logger.warning("FortyGuard status connection error: %s", exc)
+            raise FortyGuardUnavailableError() from exc
+
+        if response.status_code == 404:
+            # Eventual consistency: the id may not be queryable yet.
+            raise _ActivityNotReady(activity_id)
+
+        self._raise_for_status(response)
+        data = self._parse_json(response)
+        inner = data.get("data", data) if isinstance(data, dict) else data
+        if not isinstance(inner, dict):
+            raise FortyGuardResponseError(
+                "The FortyGuard status response had an unexpected shape."
+            )
+        return inner
+
+    async def wait_for_activity(
+        self, activity_id: str, max_wait: float | None = None
+    ) -> dict[str, Any] | None:
+        """Poll until the job finishes, fails, or the wait budget runs out.
+
+        Returns the completed ``data`` object (including ``result``) on success,
+        ``None`` if still processing when the request-scoped budget elapses (the
+        caller then returns 202 + poll URL), and raises
+        :class:`FortyGuardTaskFailedError` if the upstream reports failure.
+        """
+        interval = max(0.0, self._settings.fortyguard_poll_interval_seconds)
+        budget = (
+            self._settings.fortyguard_max_wait_seconds if max_wait is None else max_wait
+        )
+        deadline = time.monotonic() + budget
+
+        while True:
+            try:
+                data = await self.get_activity(activity_id)
+                state = self.classify_status(data)
+                if state == "completed":
+                    logger.info("FortyGuard activity completed: activity_id=%s", activity_id)
+                    return data
+                if state == "failed":
+                    logger.info(
+                        "FortyGuard activity failed: activity_id=%s status=%s",
+                        activity_id,
+                        data.get("status"),
+                    )
+                    raise FortyGuardTaskFailedError(
+                        f"The FortyGuard task did not complete "
+                        f"(status={str(data.get('status') or '').lower()})."
+                    )
+            except _ActivityNotReady:
+                pass  # not visible yet — keep polling within budget
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.info(
+                    "FortyGuard activity still processing after %.0fs: activity_id=%s",
+                    budget,
+                    activity_id,
+                )
+                return None
+            await asyncio.sleep(min(interval, remaining) if interval > 0 else 0)
+
+    async def fetch_activity(self, activity_id: str) -> dict[str, Any]:
+        """Public single status fetch for the standalone GET endpoint.
+
+        Unlike :meth:`get_activity`, a 404 here means the id is unknown or
+        expired (the submit+wait flow only returns an id once it is queryable),
+        so it maps to :class:`FortyGuardActivityNotFoundError` (HTTP 404).
+        """
+        try:
+            return await self.get_activity(activity_id)
+        except _ActivityNotReady as exc:
+            raise FortyGuardActivityNotFoundError() from exc
+
     # ----- internals ---------------------------------------------------
+    @staticmethod
+    def _parse_json(response: httpx.Response) -> Any:
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise FortyGuardResponseError(
+                "The FortyGuard API returned a non-JSON response."
+            ) from exc
+
+    @staticmethod
+    def classify_status(data: dict[str, Any]) -> str:
+        """Map an upstream status object to completed | failed | processing."""
+        status = str(data.get("status") or "").strip().lower()
+        if status in _TERMINAL_SUCCESS:
+            return "completed"
+        if status in _TERMINAL_FAILURE:
+            return "failed"
+        return "processing"
+
+    @staticmethod
+    def extract_result(data: Any) -> dict[str, Any] | None:
+        """Pull the ``result`` payload from a completed status object.
+
+        Falls back to the whole status object if no nested ``result`` is
+        present, so a caller always gets the richest dict available.
+        """
+        if not isinstance(data, dict):
+            return None
+        result = data.get("result")
+        return result if isinstance(result, dict) else data
+
+    @staticmethod
+    def _extract_activity_id(data: Any) -> str:
+        """Pull ``activity_id`` from the verified ``{"data": {...}}`` envelope."""
+        if isinstance(data, dict):
+            inner = data.get("data")
+            if isinstance(inner, dict) and inner.get("activity_id"):
+                return str(inner["activity_id"])
+            if data.get("activity_id"):
+                return str(data["activity_id"])
+        raise FortyGuardResponseError(
+            "The FortyGuard submit response did not include an activity_id."
+        )
+
+    @staticmethod
+    def _error_message(data: dict[str, Any]) -> str:
+        msg = data.get("message") or data.get("error") or "FortyGuard reported an error."
+        return str(msg)[:200]
+
+    @staticmethod
+    def extract_stats_and_count(result: Any) -> tuple[dict[str, Any] | None, int | None]:
+        """Best-effort summary of a completed result: (stats_data, feature count).
+
+        Only reads keys verified present in a live response (``stats_data``;
+        ``map_data.features``); returns ``None`` when absent rather than
+        assuming a shape.
+        """
+        stats: dict[str, Any] | None = None
+        count: int | None = None
+        if isinstance(result, dict):
+            sd = result.get("stats_data")
+            if isinstance(sd, dict):
+                stats = sd
+            md = result.get("map_data")
+            if isinstance(md, dict):
+                feats = md.get("features")
+                if isinstance(feats, list):
+                    count = len(feats)
+        return stats, count
+
+    @staticmethod
+    def _first_feature_props(result: Any) -> dict[str, Any] | None:
+        if isinstance(result, dict):
+            md = result.get("map_data")
+            if isinstance(md, dict):
+                feats = md.get("features")
+                if isinstance(feats, list) and feats and isinstance(feats[0], dict):
+                    props = feats[0].get("properties")
+                    if isinstance(props, dict):
+                        return props
+        return None
+
+    @classmethod
+    def extract_value_key(cls, result: Any) -> str | None:
+        """Infer the primary tile value property from the real tiles.
+
+        Live-verified for tcm (``average_temperature``; tiles also carry
+        min/max_temperature). Threshold analyses use ``value`` per the docs.
+        Falls back to ``temperature`` if present, else ``None``.
+        """
+        props = cls._first_feature_props(result)
+        if props is None:
+            return None
+        for key in ("average_temperature", "value", "temperature"):
+            if key in props:
+                return key
+        return None
+
     def _auth_headers(self) -> dict[str, str]:
         scheme = self._settings.fortyguard_auth_scheme.strip()
         key = self._settings.fortyguard_api_key or ""
@@ -169,6 +430,13 @@ class FortyGuardService:
             logger.warning("FortyGuard rate limit hit (429).")
             raise FortyGuardUnavailableError(
                 "The FortyGuard API rate limit was exceeded. Please retry later."
+            )
+        if code in (401, 403):
+            # The key is present but the upstream rejected it. Never echo the
+            # key or the response body (may repeat request details).
+            logger.warning("FortyGuard rejected credentials (status %s).", code)
+            raise FortyGuardUpstreamError(
+                "FortyGuard rejected the API credentials (check FORTYGUARD_API_KEY)."
             )
         if 400 <= code < 500:
             logger.warning("FortyGuard client error %s: %s", code, self._safe_snippet(response))

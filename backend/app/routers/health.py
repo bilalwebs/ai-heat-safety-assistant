@@ -25,6 +25,6 @@ async def health() -> dict:
         "version": settings.app_version,
         "environment": settings.environment,
         # Readiness flags (booleans only — no keys or URLs are exposed).
-        "fortyguard_configured": settings.fortyguard_configured,
+        "fortyguard_ready": settings.fortyguard_ready,
         "ai_llm_enabled": settings.ai_configured,
     }

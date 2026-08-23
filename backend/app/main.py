@@ -21,6 +21,7 @@ from app.routers import (
     chat,
     health,
     heat_risk,
+    heatmap,
     outdoor_plan,
     recommendations,
     temperature,
@@ -49,6 +50,7 @@ Guidance is general and not medical advice.
 TAGS_METADATA = [
     {"name": "System", "description": "Health and readiness checks."},
     {"name": "Temperature", "description": "Hyperlocal temperature readings."},
+    {"name": "Heatmap", "description": "FortyGuard heatmap submission and results (U.S. only)."},
     {"name": "Heat Risk", "description": "Heat-risk assessment and safety actions."},
     {"name": "AI Recommendations", "description": "Activity-specific safety recommendations."},
     {"name": "Outdoor Planner", "description": "Safer timing for outdoor activity."},
@@ -61,17 +63,23 @@ async def lifespan(app: FastAPI):
     settings = get_settings()
     configure_logging(settings.log_level)
     logger.info(
-        "Starting %s v%s (env=%s). FortyGuard configured=%s, AI LLM enabled=%s.",
+        "Starting %s v%s (env=%s). FortyGuard ready=%s, AI LLM enabled=%s.",
         settings.app_name,
         settings.app_version,
         settings.environment,
-        settings.fortyguard_configured,
+        settings.fortyguard_ready,
         settings.ai_configured,
     )
-    if not settings.fortyguard_configured:
+    if not settings.fortyguard_ready:
         logger.warning(
-            "FortyGuard API is not configured; temperature/heat-risk endpoints "
-            "will return HTTP 503 until FORTYGUARD_* variables are set."
+            "FortyGuard API is not configured; FortyGuard heatmap endpoints "
+            "will be unavailable until FORTYGUARD_API_KEY and "
+            "FORTYGUARD_BASE_URL are set."
+        )
+    if not settings.fortyguard_configured:
+        logger.info(
+            "Legacy single-point temperature endpoint is not configured; "
+            "FORTYGUARD_TEMPERATURE_PATH is not set."
         )
     try:
         yield
@@ -104,6 +112,7 @@ def create_app() -> FastAPI:
     app.include_router(health.router)
     # Versioned API
     app.include_router(temperature.router, prefix=API_V1)
+    app.include_router(heatmap.router, prefix=API_V1)
     app.include_router(heat_risk.router, prefix=API_V1)
     app.include_router(recommendations.router, prefix=API_V1)
     app.include_router(outdoor_plan.router, prefix=API_V1)

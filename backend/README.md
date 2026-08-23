@@ -25,6 +25,10 @@ temperature values, and clearly separates measured data from general advice.
 
 Only features that are actually implemented are listed here.
 
+- **FortyGuard heatmaps (live-verified, U.S. only)** — submit a heatmap job for
+  an area + time window and get back GeoJSON temperature tiles, via the official
+  async FortyGuard API (`POST /api/v1/heatmap`, `GET /api/v1/heatmap/{id}`). The
+  frontend never talks to FortyGuard directly.
 - **Hyperlocal temperature intelligence** — reads from the FortyGuard
   Temperature API via a single, isolated adapter and normalises the response.
 - **Heat-risk analysis** — uses FortyGuard's official risk level when provided;
@@ -113,7 +117,7 @@ backend/
 
 ```powershell
 # 1. Open the backend project
-cd D:\forty\backend
+cd D:\ai-heat-safety-assistant\backend
 
 # 2. Create a virtual environment
 python -m venv .venv
@@ -238,6 +242,76 @@ when provided upstream:
 ```json
 { "error": { "code": "fortyguard_not_configured", "message": "...", "status_code": 503 } }
 ```
+
+### `POST /api/v1/heatmap`
+Submit a FortyGuard **heatmap** job and get its result. This is the verified,
+production FortyGuard integration (async *submit → poll*, hidden behind one
+request). **FortyGuard coverage is U.S. only** — use a U.S. location (preferred
+test point: **San Jose, California**).
+
+The frontend calls this endpoint; it must **never** call `api.fortyguard.com`
+directly. Provide an area of interest as either an explicit GeoJSON
+`polygon_aoi`, or a `latitude`/`longitude` centre (a small square AOI is built
+for you — that squaring is *our* convenience, not a FortyGuard feature).
+
+**Request** (single-hour `tcm` snapshot near San Jose)
+```json
+{
+  "latitude": 37.3382,
+  "longitude": -121.8863,
+  "radius_km": 1.0,
+  "start_date": "2024-07-15",
+  "start_time": "14:00",
+  "filter_type": 1,
+  "analytic_type": "tcm",
+  "granularity": 100
+}
+```
+
+- `filter_type`: `1`=single hour (needs `start_time`), `2`=hour range (needs
+  `start_time`+`end_time`), `3`=single day, `4`=day range (needs `end_date`).
+- `granularity` ∈ `{60, 80, 100}`.
+- `analytic_type` ∈ `tcm | time_of_measure | exceedance | persistence`.
+  `exceedance`/`persistence` additionally require `threshold` (°C) and
+  `direction` (`above`/`below`).
+- Tile values live under `properties.average_temperature` for `tcm` (tiles also
+  carry `min_temperature`/`max_temperature`/`tile_id`), and under
+  `properties.value` for analysis types (`value_key` in the response tells you
+  which). The `tcm` tile shape is confirmed against the live API; the analysis
+  shapes follow the docs and are not yet live-verified.
+
+**Response (200, completed within the wait budget)**
+```json
+{
+  "activity_id": "…",
+  "status": "completed",
+  "ready": true,
+  "analytic_type": "tcm",
+  "value_key": "average_temperature",
+  "tile_count": 384,
+  "stats": { "analytic_type": "tcm", "units": "C", "min": 30.1, "max": 34.7, "mean": 32.2 },
+  "result": { "stats_data": { }, "map_data": { "type": "FeatureCollection", "features": [] } },
+  "poll_url": null,
+  "coverage_note": "FortyGuard coverage is U.S. only — …",
+  "disclaimer": "Heatmap values are model-derived environmental data …",
+  "timestamp": "2026-08-23T10:00:01.123456+00:00"
+}
+```
+
+**Response (202, still processing after the wait budget)** — poll `poll_url`:
+```json
+{
+  "activity_id": "…",
+  "status": "processing",
+  "ready": false,
+  "poll_url": "/api/v1/heatmap/…",
+  "timestamp": "2026-08-23T10:00:26.123456+00:00"
+}
+```
+
+### `GET /api/v1/heatmap/{activity_id}`
+Fetch a previously-submitted heatmap job: **200** completed, **202** still
+processing, **404** unknown/expired id, **502** if the upstream task failed.
 
 ### `POST /api/v1/heat-risk`
 Risk level, explanation and recommended actions.
@@ -429,11 +503,22 @@ raw stack traces and secrets are never returned.
 Verified = implemented **and** exercised (tests and/or a running server).
 
 - [x] Project scaffold, config, logging, CORS, error handling
-- [x] FortyGuard adapter — implemented; verified via mocked HTTP
-      (success, timeout, connection, 404, 4xx, 5xx, bad-response, not-configured)
-- [ ] FortyGuard **live** integration verified with a real API key
-      *(blocked: no key / exact contract in this workspace — see the manual
-      test above; fill in `.env` and confirm `_normalize()` fields)*
+- [x] **FortyGuard heatmap integration** (`POST /api/v1/heatmap`,
+      `GET /api/v1/heatmap/{activity_id}`) — async submit→poll via the verified
+      `api-key` header; verified via mocked HTTP (submit, poll, completed,
+      failed→502, timeout→504, 404-not-ready, not-configured→503, malformed→502,
+      no key leak)
+- [x] **FortyGuard heatmap — LIVE integration verified with a real API key**
+      *(San Jose, CA, tcm; `POST /api/v1/heatmap` → 200 completed, 384 tiles,
+      `value_key=average_temperature`; verified 2026-08-23. No key leaked in
+      response or logs.)*
+- [x] Legacy FortyGuard temperature adapter — implemented; verified via mocked
+      HTTP (success, timeout, connection, 404, 4xx, 5xx, bad-response,
+      not-configured)
+- [ ] Legacy `/api/v1/temperature` + `/api/v1/heat-risk` **live** — the real
+      FortyGuard API has no single-point temperature lookup, so these stay
+      **HTTP 503** unless pointed at a compatible endpoint (see "Known gaps"
+      below). Not part of the heatmap integration.
 - [x] `/health` endpoint (verified on a running server)
 - [x] `/api/v1/temperature` endpoint (verified: 200 happy-path via mock, 503, 422)
 - [x] `/api/v1/heat-risk` endpoint (verified)
@@ -441,5 +526,18 @@ Verified = implemented **and** exercised (tests and/or a running server).
 - [x] Outdoor planner endpoint (verified, rule-based)
 - [x] AI chat endpoint (verified, rule-based)
 - [x] Optional LLM path (verified via mocked provider, incl. fallback)
-- [x] Automated tests (25 passing)
+- [x] Automated tests (52 passing; all external HTTP mocked)
 - [ ] Frontend integration
+
+### Known gaps
+
+- The FortyGuard API is heatmap-oriented (area + time → GeoJSON tiles) and has
+  **no single point-in-time temperature endpoint**. The pre-existing
+  `/api/v1/temperature` and `/api/v1/heat-risk` endpoints were built around such
+  a lookup and therefore remain **503** until re-pointed at the heatmap flow
+  (that re-pointing is deliberately out of scope for the heatmap integration).
+- FortyGuard coverage is **U.S. only** — non-U.S. locations will not return data.
+- Live integration verified for **`tcm`** only. `time_of_measure`, `exceedance`,
+  and `persistence` are implemented and validated but their live tile shapes are
+  **not yet verified** against the real API (the code passes tiles through
+  untransformed, so no data is lost regardless).

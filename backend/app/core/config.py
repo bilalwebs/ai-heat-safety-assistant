@@ -42,23 +42,34 @@ class Settings(BaseSettings):
     )
 
     # ----- FortyGuard Temperature API ---------------------------------
-    # These values MUST be filled in with the real contract obtained from
-    # https://docs-api.fortyguard.com. They are intentionally left unset so
-    # the application fails loudly (HTTP 503) rather than calling a guessed
-    # endpoint or fabricating data.
+    # Contract verified against the official client
+    # (github.com/FortyGuard-Tech/temperature-api-quickstart):
+    #   * host https://api.fortyguard.com
+    #   * auth header  `api-key: <key>`  (NOT `Authorization: Bearer`)
+    #   * async: submit POST /v1/heatmap -> poll GET /v1/status/{activity_id}
+    # The key and base URL come from the environment; nothing is hard-coded.
     fortyguard_api_key: str | None = None
     fortyguard_base_url: str | None = None
+
+    # Legacy single-shot temperature endpoint path. NOT used by the async
+    # heatmap integration; the /temperature endpoint stays 503 until it is set
+    # (the real API has no such point-lookup — see README "Known gaps").
     fortyguard_temperature_path: str | None = None
 
-    # Auth + transport shape (defaults are common conventions; confirm them
-    # against the real FortyGuard documentation before relying on them).
-    fortyguard_auth_header: str = "Authorization"
-    fortyguard_auth_scheme: str = "Bearer"  # set empty for raw-key headers
+    # Auth + transport shape. Defaults match the verified FortyGuard contract:
+    # a raw `api-key` header with no scheme prefix.
+    fortyguard_auth_header: str = "api-key"
+    fortyguard_auth_scheme: str = ""  # empty -> raw key, no "Bearer " prefix
     fortyguard_http_method: str = "GET"
     fortyguard_request_style: str = "query"  # "query" or "json"
     fortyguard_timeout_seconds: float = 10.0
 
-    # Request parameter names used when building the outgoing call.
+    # Async heatmap workflow (submit -> poll). The request-scoped wait is
+    # bounded so an HTTP request never hangs for the full upstream budget.
+    fortyguard_poll_interval_seconds: float = 3.0
+    fortyguard_max_wait_seconds: float = 25.0
+
+    # Request parameter names used by the legacy temperature call.
     fortyguard_location_param: str = "location"
     fortyguard_lat_param: str = "lat"
     fortyguard_lon_param: str = "lon"
@@ -85,6 +96,15 @@ class Settings(BaseSettings):
             and self.fortyguard_base_url
             and self.fortyguard_temperature_path
         )
+
+    @property
+    def fortyguard_ready(self) -> bool:
+        """True when the async FortyGuard API (heatmap) can be called.
+
+        Only an API key and base URL are required: the async endpoints
+        (/v1/heatmap, /v1/status/{id}) are fixed and need no path config.
+        """
+        return bool(self.fortyguard_api_key and self.fortyguard_base_url)
 
     @property
     def ai_configured(self) -> bool:

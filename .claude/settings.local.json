@@ -14,7 +14,25 @@
       "Bash(curl -s http://127.0.0.1:8000/health)",
       "Bash(curl -s http://127.0.0.1:8000/openapi.json)",
       "Bash(curl -s -o /dev/null -w '%{http_code}\\\\n' http://127.0.0.1:8000/redoc)",
-      "Bash(./.venv/Scripts/python.exe -m pytest -q)"
+      "Bash(./.venv/Scripts/python.exe -m pytest -q)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(git fetch *)",
+      "Bash(.venv/Scripts/python.exe -)",
+      "Bash(.venv/Scripts/python.exe -m pytest -q)",
+      "Bash(git checkout *)",
+      "Bash(.venv/Scripts/python.exe -m pytest tests/test_heatmap.py -q)",
+      "Bash(.venv/Scripts/python.exe -c ' *)",
+      "Bash(FORTYGUARD_BASE_URL=https://api.fortyguard.com FORTYGUARD_TIMEOUT_SECONDS=15 .venv/Scripts/python.exe _inspect_tmp.py)",
+      "Bash(FORTYGUARD_BASE_URL=https://api.fortyguard.com FORTYGUARD_MAX_WAIT_SECONDS=90 FORTYGUARD_POLL_INTERVAL_SECONDS=3 FORTYGUARD_TIMEOUT_SECONDS=15 .venv/Scripts/python.exe _smoke_test_tmp.py)",
+      "Bash(.venv/Scripts/python.exe -m py_compile app/services/fortyguard_service.py app/routers/heatmap.py app/schemas/heatmap.py app/main.py app/core/config.py app/core/exceptions.py tests/test_heatmap.py)",
+      "Bash(.venv/Scripts/python.exe -c \"from app.main import app; print\\('APP IMPORT OK; routes in openapi:', [p for p in app.openapi\\(\\)['paths'] if 'heatmap' in p]\\)\")",
+      "Bash(ls \"/c/Users/BILAL HUSSAIN/.claude/projects/D--ai-heat-safety-assistant/memory/\" 2>&1 | tail -20; echo \"=== MEMORY.md ===\"; cat \"/c/Users/BILAL HUSSAIN/.claude/projects/D--ai-heat-safety-assistant/memory/MEMORY.md\" 2>/dev/null | tail -30)",
+      "Bash(./.venv/Scripts/python.exe -c \"from app.main import app; ps=sorted\\(p for p in app.openapi\\(\\)['paths'] if 'heatmap' in p\\); print\\('HEATMAP ROUTES:', ps\\)\")",
+      "Bash(git check-ignore *)",
+      "Bash(backend/.venv/Scripts/python.exe -c \"import sys; sys.path.insert\\(0,'backend'\\); from app.main import app; ps=sorted\\(p for p in app.openapi\\(\\)['paths'] if 'heatmap' in p\\); print\\('HEATMAP ROUTES:', ps\\)\")",
+      "Bash(backend/.venv/Scripts/python.exe -m py_compile backend/app/main.py)",
+      "Bash(../backend/.venv/Scripts/python.exe -c \"import app.main; print\\('IMPORT_OK'\\)\")",
+      "Bash(../backend/.venv/Scripts/python.exe -c ' *)"
     ]
   }
 }
